@@ -40,6 +40,7 @@ import torch
 __all__ = [
     "CLASS_NAMES", "ROOT", "paths", "preflight", "get_device",
     "Detections", "Detector", "draw", "show", "live_camera", "MODELS",
+    "bootstrap", "load_labels", "split_images", "list_cameras",
 ]
 
 # ----------------------------------------------------------------------------------
@@ -115,6 +116,8 @@ MODELS = {
                 "label": "YOLO26 nano"},
     "yolo11n": {"family": "yolo", "weights": "yolo11n_best.pt", "imgsz": 640,
                 "label": "YOLO11 nano"},
+    "yolo11s": {"family": "yolo", "weights": "yolo11s_best.pt", "imgsz": 640,
+                "label": "YOLO11 small"},
     "ssdlite": {"family": "ssd", "weights": "ssdlite_best.pt", "imgsz": 320,
                 "label": "SSDLite320-MobileNetV3"},
 }
@@ -176,6 +179,205 @@ def preflight(require_train_split: bool = False, verbose: bool = True) -> bool:
             print("      git clone https://github.com/Shamprakash1609/PPE-Detection.git")
         print()
     return ok
+
+
+def _ssd_extras(model_name: str, imgsz: int, det) -> dict:
+    """The SSDLite notebook's own names — it has a hand-written training loop.
+
+    Notebooks 01/02 lean on Ultralytics, so their later sections need only a model
+    and some paths. Notebook 03 builds its own Dataset, loaders and history list, so
+    running it from the middle needs those rebuilt too.
+    """
+    import pandas as _pd
+    import torch as _torch
+    from torch.utils.data import Dataset as _Dataset, DataLoader as _DataLoader
+    from torchmetrics.detection import MeanAveragePrecision as _MAP
+
+    num_classes = len(CLASS_NAMES) + 1
+    idx_to_name = {i + 1: n for i, n in CLASS_NAMES.items()}
+
+    class PPEDataset(_Dataset):
+        def __init__(self, root, split, size=imgsz, train=False):
+            self.img_dir = Path(root) / "images" / split
+            self.lbl_dir = Path(root) / "labels" / split
+            self.imgsz, self.train = size, train
+            self.items = sorted(q for q in self.img_dir.glob("*")
+                                if q.suffix.lower() in IMG_EXT)
+
+        def __len__(self):
+            return len(self.items)
+
+        def __getitem__(self, i):
+            path = self.items[i]
+            img = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
+            h0, w0 = img.shape[:2]
+            img = cv2.resize(img, (self.imgsz, self.imgsz))
+            boxes, labels = [], []
+            lbl = self.lbl_dir / f"{path.stem}.txt"
+            if lbl.exists():
+                for line in lbl.read_text().strip().splitlines():
+                    parts = line.split()
+                    if len(parts) < 5:
+                        continue
+                    c = int(parts[0])
+                    cx, cy, bw, bh = (float(v) for v in parts[1:5])
+                    x1 = max(0.0, (cx - bw / 2) * self.imgsz)
+                    y1 = max(0.0, (cy - bh / 2) * self.imgsz)
+                    x2 = min(float(self.imgsz), (cx + bw / 2) * self.imgsz)
+                    y2 = min(float(self.imgsz), (cy + bh / 2) * self.imgsz)
+                    if x2 - x1 < 1.0 or y2 - y1 < 1.0:
+                        continue
+                    boxes.append([x1, y1, x2, y2])
+                    labels.append(c + 1)
+            t = _torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+            return t, {
+                "boxes": _torch.tensor(boxes, dtype=_torch.float32) if boxes
+                         else _torch.zeros((0, 4), dtype=_torch.float32),
+                "labels": _torch.tensor(labels, dtype=_torch.int64) if labels
+                          else _torch.zeros((0,), dtype=_torch.int64),
+                "image_id": _torch.tensor([i]),
+                "orig_size": _torch.tensor([h0, w0]),
+                "path": str(path),
+            }
+
+    def collate(batch):
+        return tuple(zip(*batch))
+
+    train_ds = PPEDataset(paths.dataset, "train", train=True)
+    val_ds   = PPEDataset(paths.dataset, "val")
+    test_ds  = PPEDataset(paths.dataset, "test")
+
+    log = paths.root / "training_logs" / f"{model_name}_results.csv"
+    history = _pd.read_csv(log).to_dict(orient="records") if log.exists() else []
+    best = ({"map": max(h["mAP50-95"] for h in history),
+             "epoch": int(max(history, key=lambda h: h["mAP50-95"])["epoch"])}
+            if history else {"map": -1.0, "epoch": 0})
+
+    return {
+        "model": det.model, "NUM_CLASSES": num_classes, "IDX_TO_NAME": idx_to_name,
+        "PPEDataset": PPEDataset, "collate": collate,
+        "train_ds": train_ds, "val_ds": val_ds, "test_ds": test_ds,
+        "val_loader": _DataLoader(val_ds, batch_size=8, shuffle=False,
+                                  num_workers=0, collate_fn=collate),
+        "train_loader": _DataLoader(train_ds, batch_size=8, shuffle=True,
+                                    num_workers=0, collate_fn=collate),
+        "metric": _MAP(box_format="xyxy", iou_type="bbox", class_metrics=True),
+        "history": history, "best": best,
+        # the epoch table in section 11 builds `hist`; the recap in section 16
+        # uses it, so provide it for anyone starting from section 12
+        "hist": _pd.DataFrame(history),
+        "PRED_DIR": paths.root / "predictions" / model_name,
+        "CONF": 0.30, "SEED": 0, "LR": 1e-3,
+    }
+
+
+def bootstrap(model_name: str, verbose: bool = True) -> dict:
+    """Rebuild everything the validation / prediction / export sections need.
+
+    Those sections depend only on the trained weights and the dataset, but they
+    reference names created by the setup and training cells above them. Restart the
+    kernel, or jump straight to the testing section, and you get a cascade of
+    NameErrors that look alarming and have nothing to do with the model.
+
+    This reconstructs that state from disk. Feed the result through
+    `globals().setdefault(...)` so anything the earlier cells already defined is
+    left exactly as it was.
+    """
+    import json as _json, platform as _platform, shutil as _shutil, sys as _sys
+    import time as _time
+    from collections import Counter as _Counter
+    import numpy as _np, pandas as _pd
+    import matplotlib.pyplot as _plt
+
+    spec = MODELS[model_name]
+    dev, backend = get_device(verbose=False)
+    gpu = backend != "cpu"
+
+    weights = paths.trained_model / spec["weights"]
+    if not weights.exists():
+        raise FileNotFoundError(chr(10).join([
+            "=" * 70,
+            f"  Trained weights not found for '{model_name}':",
+            f"    {weights}",
+            "",
+            "  Re-clone the repository — the weights are committed there.",
+            "=" * 70]))
+
+    # class frequencies in the training split, used by the per-class charts
+    counts = _Counter()
+    train_lbl = paths.labels / "train"
+    if train_lbl.is_dir():
+        for f in train_lbl.glob("*.txt"):
+            for line in f.read_text().strip().splitlines():
+                if line.strip():
+                    counts[int(line.split()[0])] += 1
+
+    det = None
+    if spec["family"] == "yolo":
+        from ultralytics import YOLO as _CLS
+        model = _CLS(str(weights))
+        n_params = sum(q.numel() for q in model.model.parameters())
+    else:
+        det = Detector(model_name, device=dev, backend=backend, verbose=False)
+        _CLS, model, n_params = type(det.model), det.model, det.n_params
+
+    run_dir = paths.root / "runs" / model_name
+    logs = paths.root / "training_logs"
+
+    def results_csv():
+        for cand in (run_dir / "results.csv", logs / f"{model_name}_results.csv"):
+            if cand.exists():
+                return cand
+        return None
+
+    ctx = {
+        # modules the cells use
+        "json": _json, "sys": _sys, "time": _time, "platform": _platform,
+        "shutil": _shutil, "Path": Path, "Counter": _Counter,
+        "np": _np, "pd": _pd, "plt": _plt, "cv2": cv2, "torch": torch,
+        # project layout
+        "PROJECT": paths.root, "DATA_ROOT": paths.dataset,
+        "DATA_YAML": paths.dataset.parent / "construction-ppe.yaml",
+        "RUNS_DIR": paths.root / "runs", "PRED_ROOT": paths.root / "predictions",
+        "TRAINED_DIR": paths.trained_model, "EXPORT_DIR": paths.root / "exports",
+        "LOGS_DIR": logs, "SAVE_DIR": run_dir,
+        # runtime
+        "DEVICE": str(dev) if spec["family"] == "yolo" else dev,
+        "GPU_AVAILABLE": gpu, "GPU_TYPE": backend if gpu else None,
+        "GPU_NAME": backend.upper() if gpu else "none",
+        "HOST": {"os": f"{_platform.system()} {_platform.release()}",
+                 "arch": _platform.machine(), "cores": os.cpu_count()},
+        "BACKEND": backend,
+        # config
+        "RUN_NAME": model_name, "MODEL_NAME": spec["weights"],
+        "MODEL_CLS": _CLS, "BEST": weights, "OG_WEIGHTS": paths.og_model / spec["weights"],
+        "IMGSZ": spec["imgsz"], "BATCH": 16 if gpu else 4,
+        "WORKERS": 0, "AMP": backend == "cuda", "EPOCHS": 0,
+        "BENCH_RUNS": 20 if gpu else 5,
+        "BENCH_SIZES": (640, 512, 416, 320) if gpu else (416, 320),
+        # names the training cells would have produced
+        "CLASS_NAMES": CLASS_NAMES, "IMG_EXT": IMG_EXT, "counts": counts,
+        "n_params": n_params, "elapsed": 0.0, "epoch_times": [],
+        "guard": {"cooldowns": 0, "baseline": None, "paused": 0.0},
+        "saved": {k: str(paths.trained_model / f"{model_name}_{k}.pt")
+                  for k in ("best", "last")
+                  if (paths.trained_model / f"{model_name}_{k}.pt").exists()},
+        "results_csv": results_csv,
+        "best_model": model,
+    }
+
+    if spec["family"] == "ssd":
+        ctx.update(_ssd_extras(model_name, spec["imgsz"], det))
+
+    if verbose:
+        log = results_csv()
+        print(f"Section context rebuilt for '{model_name}':")
+        print(f"  weights   : {weights.name}  ({weights.stat().st_size/1024**2:.2f} MB)")
+        print(f"  device    : {backend.upper()}")
+        print(f"  imgsz     : {spec['imgsz']}")
+        print(f"  epoch log : {log.name if log else 'not found'}")
+        print(f"  train class counts loaded: {sum(counts.values())} boxes")
+    return ctx
 
 
 # ----------------------------------------------------------------------------------
