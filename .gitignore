@@ -4,7 +4,6 @@ __pycache__/
 .DS_Store
 runs/
 predictions/
-outputs/
 *.cache
 # regenerable export artifacts — the notebooks recreate these
 trained_model/*.onnx

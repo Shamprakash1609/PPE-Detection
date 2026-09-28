@@ -330,6 +330,14 @@ def bootstrap(model_name: str, verbose: bool = True) -> dict:
                 return cand
         return None
 
+    # Folders the later cells write into. A fresh clone has none of them, and
+    # cells like the exporter do shutil.copy2 into EXPORT_DIR without creating
+    # it, so make them here rather than letting the first write crash.
+    for _d in (paths.root / "runs" / model_name,
+               paths.root / "predictions" / model_name,
+               paths.root / "exports", paths.outputs):
+        _d.mkdir(parents=True, exist_ok=True)
+
     ctx = {
         # modules the cells use
         "json": _json, "sys": _sys, "time": _time, "platform": _platform,
