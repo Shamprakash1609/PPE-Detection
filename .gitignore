@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+runs/
+predictions/
+outputs/
+*.cache
+# regenerable export artifacts — the notebooks recreate these
+trained_model/*.onnx
+trained_model/*.torchscript
+exports/

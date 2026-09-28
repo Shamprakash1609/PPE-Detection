@@ -1,0 +1,24 @@
+# PPE Detection — inference requirements
+#
+#   pip install -r requirements.txt
+#
+# Python 3.10-3.13 recommended. On 3.14 everything here still works, but
+# coremltools has no wheel yet (only affects CoreML export, which is optional).
+#
+# torch/torchvision install the CPU build by default, which is enough to run
+# every notebook. For an NVIDIA GPU, install the CUDA build first from
+# https://pytorch.org/get-started/locally/ then run this file.
+
+torch>=2.2
+torchvision>=0.17
+ultralytics>=8.4.0
+torchmetrics>=1.4
+opencv-python>=4.9
+numpy>=1.26,<2.4
+pandas>=2.0
+matplotlib>=3.8
+pyyaml>=6.0
+
+# notebook environment
+jupyter>=1.0
+ipykernel>=6.29
