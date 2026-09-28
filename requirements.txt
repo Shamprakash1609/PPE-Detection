@@ -19,6 +19,13 @@ pandas>=2.0
 matplotlib>=3.8
 pyyaml>=6.0
 
+# ONNX export (section 15). Without these preinstalled, Ultralytics attempts a
+# pip install from inside the cell mid-run — slow at best, a caught failure on
+# a network-restricted machine. Listing them here makes export work offline.
+onnx>=1.15
+onnxslim>=0.1.82
+onnxruntime>=1.17
+
 # notebook environment
 jupyter>=1.0
 ipykernel>=6.29
