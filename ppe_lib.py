@@ -505,86 +505,281 @@ def _capture_api() -> int:
     return cv2.CAP_ANY
 
 
-def live_camera(detector: "Detector", camera: int = 0, conf: float = 0.35,
-                imgsz: int | None = None, width: int = 1280, height: int = 720,
-                window: str = "PPE Detection — press Q to quit",
-                mirror: bool = True, max_seconds: float | None = None) -> None:
-    """Open a window with live predictions from the webcam.
+class _FrameGrabber:
+    """Read frames in a background thread and keep only the newest one.
 
-    Press Q or ESC to close. Runs in the kernel's own process, so the window belongs
-    to whatever is hosting the notebook — in VS Code and Jupyter that is fine, but it
-    will NOT appear in a browser-only environment such as Colab.
+    This is the fix for webcam lag, and it is worth understanding why.
+
+    `cap.read()` blocks — measured at ~35 ms on this machine, so a serial
+    read-infer-draw loop is capped near 28 FPS no matter how fast the model is
+    (inference is ~6 ms). Worse, the driver queues frames while inference runs, and
+    `read()` returns the OLDEST queued frame, so displayed latency grows the longer
+    you watch. `CAP_PROP_BUFFERSIZE = 1` is the usual remedy but many backends
+    silently reject it (AVFoundation returns False and leaves it at -1).
+
+    Reading continuously in a thread drains that queue as fast as the camera fills
+    it, and the main loop always takes the most recent frame. Capture then overlaps
+    inference instead of serialising with it, and latency stays flat.
     """
-    if imgsz is not None:
-        original, detector.imgsz = detector.imgsz, imgsz
 
-    with _quiet_stderr():
-        cap = cv2.VideoCapture(camera, _capture_api())
-    if not cap.isOpened():
+    def __init__(self, src: int, api: int, width: int, height: int):
+        import threading
+        with _quiet_stderr():
+            self.cap = cv2.VideoCapture(src, api)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"camera {src} would not open")
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # honoured on some backends only
+
+        self._frame = None
+        self._seq = 0
+        self._stop = False
+        self._lock = threading.Lock()
+        self._fps = 0.0
+        ok, first = self.cap.read()
+        if not ok:
+            self.cap.release()
+            raise RuntimeError(f"camera {src} opened but returned no frames")
+        self._frame, self._seq = first, 1
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        prev = time.perf_counter()
+        while not self._stop:
+            ok, f = self.cap.read()
+            if not ok:
+                time.sleep(0.005)
+                continue
+            now = time.perf_counter()
+            dt = now - prev
+            prev = now
+            with self._lock:
+                # publish by reference — cap.read() allocates a fresh array each
+                # time, so no copy is needed and none is made
+                self._frame = f
+                self._seq += 1
+                if dt > 0:
+                    self._fps = 0.9 * self._fps + 0.1 * (1.0 / dt)
+
+    def latest(self):
+        """Newest frame and its sequence number. Never blocks on the camera."""
+        with self._lock:
+            return self._frame, self._seq
+
+    @property
+    def capture_fps(self) -> float:
+        with self._lock:
+            return self._fps
+
+    def release(self):
+        self._stop = True
+        self._thread.join(timeout=1.0)
+        self.cap.release()
+
+
+_HELP = [
+    "Q / ESC   quit",
+    "SPACE     pause",
+    "+ / -     confidence",
+    "[ / ]     input size",
+    "M         next model",
+    "B         boxes on/off",
+    "S         save snapshot",
+    "H         hide this help",
+]
+
+
+def _hud(img, lines, origin=(10, 10), alpha=0.55):
+    """Translucent panel so text stays readable over any footage."""
+    x, y = origin
+    pad, lh = 8, 20
+    w = max(cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0][0] for t in lines) + pad * 2
+    h = lh * len(lines) + pad
+    panel = img[y:y + h, x:x + w]
+    if panel.size:
+        img[y:y + h, x:x + w] = cv2.addWeighted(
+            panel, 1 - alpha, np.full_like(panel, 30), alpha, 0)
+    for i, t in enumerate(lines):
+        cv2.putText(img, t, (x + pad, y + pad + lh * i + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (240, 240, 240), 1, cv2.LINE_AA)
+
+
+def live_camera(detector, camera: int = 0, conf: float = 0.35,
+                imgsz: int | None = None, width: int = 1280, height: int = 720,
+                window: str = "PPE Detection",
+                mirror: bool = True, max_seconds: float | None = None,
+                models: dict | None = None, show_help: bool = True) -> None:
+    """Live webcam detection in a window, with interactive controls.
+
+    Capture runs in its own thread so it never blocks inference — see
+    _FrameGrabber for why that matters more than model speed here.
+
+    Keys
+        Q / ESC   quit              SPACE   pause
+        + / -     confidence        [ / ]   input size
+        M         next model        B       toggle boxes
+        S         save a snapshot   H       toggle the help panel
+
+    `models` may be a {name: Detector} dict to enable model switching with M.
+    """
+    sizes = [320, 416, 512, 640]
+    if imgsz is not None:
+        detector.imgsz = imgsz
+    if detector.imgsz not in sizes:
+        sizes = sorted(set(sizes + [detector.imgsz]))
+
+    pool = list(models.items()) if models else [(detector.name, detector)]
+    idx = next((i for i, (n, _) in enumerate(pool) if n == detector.name), 0)
+    det = pool[idx][1]
+    det.imgsz = detector.imgsz
+
+    try:
+        grab = _FrameGrabber(camera, _capture_api(), width, height)
+    except RuntimeError as e:
+        print(f"Could not start camera {camera}: {e}")
         avail = list_cameras()
-        print(f"Could not open camera {camera}.")
         print(f"Cameras that do open: {avail if avail else 'none found'}")
         if platform.system() == "Darwin":
-            print("On macOS, grant camera access to the app hosting this kernel:")
-            print("  System Settings > Privacy & Security > Camera")
+            print("macOS: System Settings > Privacy & Security > Camera, then allow")
+            print("the app hosting this kernel (VS Code / Terminal).")
         elif platform.system() == "Windows":
-            print("On Windows, check Settings > Privacy > Camera, and close any other")
-            print("app using the webcam (Teams and Zoom hold it exclusively).")
+            print("Windows: Settings > Privacy > Camera. Close Teams/Zoom first —")
+            print("they hold the webcam exclusively.")
         return
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    snaps = paths.outputs / "snapshots"
+    print(f"Live: {det.spec['label']} @ {det.imgsz}px on {det.backend.upper()}")
+    print("Q quit | SPACE pause | +/- conf | [ ] size | M model | B boxes | S save | H help")
 
-    print(f"Live: {detector.spec['label']} @ {detector.imgsz}px on {detector.backend.upper()}")
-    print("Press Q or ESC in the video window to stop.")
+    dets = Detections()
+    paused = False
+    boxes_on = True
+    dirty = True          # force one draw on entry
+    pending_key = None    # key captured during an idle wait
+    infer_ms, disp_fps = 0.0, 0.0
+    last_seq, shots, frames = -1, 0, 0
+    prev = time.perf_counter()
+    started = prev
 
-    fps, prev, started, frames = 0.0, time.perf_counter(), time.perf_counter(), 0
     try:
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                print("Camera stopped returning frames.")
-                break
-            if mirror:
-                frame = cv2.flip(frame, 1)
+            frame, seq = grab.latest()
+            if frame is None:
+                time.sleep(0.005)
+                continue
 
-            dets = detector.predict(frame, conf=conf)
-            out = draw(frame, dets)
+            fresh = seq != last_seq
+            if not paused and fresh:
+                last_seq = seq
+                t0 = time.perf_counter()
+                dets = det.predict(frame, conf=conf)
+                infer_ms = 0.9 * infer_ms + 0.1 * (time.perf_counter() - t0) * 1000
+            elif not dirty:
+                # No new frame and nothing changed on screen. Redrawing would just
+                # burn CPU — the threaded grabber lets this loop spin far faster
+                # than the camera produces frames. Still call waitKey so the window
+                # stays responsive to keys and to being closed.
+                k = cv2.waitKey(3) & 0xFF
+                if k != 255:
+                    pending_key = k
+                else:
+                    try:
+                        if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
+                            break
+                    except cv2.error:
+                        break
+                    if max_seconds and (time.perf_counter() - started) > max_seconds:
+                        break
+                    continue
+
+            view = frame.copy()
+            if mirror:
+                view = cv2.flip(view, 1)
+            if boxes_on and len(dets):
+                d = dets
+                if mirror:                      # mirror the boxes to match the image
+                    w = view.shape[1]
+                    b = d.boxes.copy()
+                    b[:, [0, 2]] = w - d.boxes[:, [2, 0]]
+                    d = Detections(b, d.scores, d.labels)
+                view = draw(view, d)
 
             now = time.perf_counter()
-            fps = 0.9 * fps + 0.1 * (1.0 / max(now - prev, 1e-6))
+            disp_fps = 0.9 * disp_fps + 0.1 * (1.0 / max(now - prev, 1e-6))
             prev = now
             frames += 1
 
             missing = sum(1 for c in dets.labels if int(c) in MISSING_PPE)
-            banner = f"{fps:5.1f} FPS | {len(dets)} detections"
-            cv2.rectangle(out, (0, 0), (out.shape[1], 34), (0, 0, 0), -1)
-            cv2.putText(out, banner, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                        (255, 255, 255), 2)
+            status = [
+                f"{det.spec['label']}  {det.imgsz}px  conf {conf:.2f}",
+                f"display {disp_fps:5.1f} FPS | camera {grab.capture_fps:5.1f} FPS | "
+                f"infer {infer_ms:4.1f} ms",
+                f"{len(dets)} detections" + ("  [PAUSED]" if paused else ""),
+            ]
+            _hud(view, status)
+            if show_help:
+                _hud(view, _HELP, origin=(10, view.shape[0] - 20 * len(_HELP) - 18))
             if missing:
-                warn = f"MISSING PPE: {missing}"
-                (tw, _), _ = cv2.getTextSize(warn, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
-                cv2.putText(out, warn, (out.shape[1] - tw - 12, 24),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (60, 60, 240), 2)
+                txt = f"MISSING PPE x{missing}"
+                (tw, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+                cv2.putText(view, txt, (view.shape[1] - tw - 14, 34),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (60, 60, 240), 2, cv2.LINE_AA)
 
-            cv2.imshow(window, out)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), ord("Q"), 27):
+            cv2.imshow(window, view)
+            dirty = False
+            k = pending_key if pending_key is not None else (cv2.waitKey(1) & 0xFF)
+            pending_key = None
+
+            if k != 255:
+                dirty = True      # a key changed something, so redraw next pass
+
+            if k in (ord("q"), ord("Q"), 27):
                 break
-            if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
-                break          # user clicked the X
+            elif k == 32:
+                paused = not paused
+            elif k in (ord("+"), ord("=")):
+                conf = min(0.95, round(conf + 0.05, 2))
+            elif k in (ord("-"), ord("_")):
+                conf = max(0.05, round(conf - 0.05, 2))
+            elif k == ord("]"):
+                det.imgsz = sizes[min(sizes.index(det.imgsz) + 1, len(sizes) - 1)]
+            elif k == ord("["):
+                det.imgsz = sizes[max(sizes.index(det.imgsz) - 1, 0)]
+            elif k in (ord("m"), ord("M")) and len(pool) > 1:
+                keep = det.imgsz
+                idx = (idx + 1) % len(pool)
+                det = pool[idx][1]
+                det.imgsz = keep if keep in sizes else det.imgsz
+            elif k in (ord("b"), ord("B")):
+                boxes_on = not boxes_on
+            elif k in (ord("h"), ord("H")):
+                show_help = not show_help
+            elif k in (ord("s"), ord("S")):
+                snaps.mkdir(parents=True, exist_ok=True)
+                shots += 1
+                out = snaps / f"snap_{shots:03d}.jpg"
+                cv2.imwrite(str(out), view)
+                print(f"saved {out}")
+
+            try:
+                if cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+            except cv2.error:
+                break
             if max_seconds and (now - started) > max_seconds:
                 break
     except KeyboardInterrupt:
         print("Interrupted.")
     finally:
-        cap.release()
+        grab.release()
         cv2.destroyAllWindows()
-        for _ in range(5):     # macOS needs extra waitKey calls to actually close
+        for _ in range(5):          # macOS needs the extra waitKey to actually close
             cv2.waitKey(1)
-        if imgsz is not None:
-            detector.imgsz = original
-        print(f"Stopped after {frames} frames ({fps:.1f} FPS at the end).")
+        print(f"Stopped after {frames} frames — {disp_fps:.1f} FPS display, "
+              f"{grab.capture_fps:.1f} FPS camera, {infer_ms:.1f} ms inference."
+              + (f" {shots} snapshot(s) in {snaps}" if shots else ""))
 
 
 # ----------------------------------------------------------------------------------
