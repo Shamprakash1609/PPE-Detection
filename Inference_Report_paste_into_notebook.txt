@@ -1,0 +1,95 @@
+# 📋 Inference Report — Construction PPE Detection
+
+*Four object detectors trained and compared on one dataset, one evaluation harness, one machine (Apple M2 Pro, Metal GPU). Everything below is measured, not estimated.*
+
+---
+
+## 1. Dataset
+
+| | |
+|---|---|
+| Source | Ultralytics **Construction-PPE** (AGPL-3.0) |
+| Images | **1,416** total — 1,132 train / 143 val / 141 test |
+| Labelled boxes | ~9,200 (YOLO format, normalised `cx cy w h`) |
+| Scenes | Real construction sites: distant workers, occlusion, mixed lighting |
+| Class imbalance | **≈ 20 : 1** — `Person` has 1,790 boxes, `no_boots` only 88 |
+
+The class-frequency chart drawn **before** training predicted the final result almost perfectly: classes rare in the data ended up weak in every model, regardless of architecture.
+
+## 2. Classes (11)
+
+| Group | Classes | Train instances |
+|---|---|---|
+| Worn PPE | `helmet` (1357) · `vest` (1283) · `boots` (1251) · `gloves` (1162) · `goggles` (427) | plentiful → learned well |
+| Anchors | `Person` (1790) · `none` (654) | plentiful |
+| **Missing PPE** | `no_gloves` (442) · `no_helmet` (400) · `no_goggle` (337) · `no_boots` (88) | **scarce → weak in every model** |
+
+The `no_*` classes are the ones a compliance system exists to catch — and the rarest in the data. That tension is the central finding of this project.
+
+## 3. Models
+
+| Model | Family | Framework | Params | Weights | Input | Role |
+|---|---|---|---:|---:|---:|---|
+| **YOLO26n** | YOLO, anchor-free, dual-head (NMS-free option) | Ultralytics | 2.51 M | 5.2 MB | 640 px | Primary candidate |
+| **YOLO11n** | YOLO, anchor-free (C3k2 + C2PSA) | Ultralytics | 2.59 M | 5.2 MB | 640 px | Control / baseline |
+| **SSDLite320** | SSD, **anchor-based**, MobileNetV3 backbone | torchvision (hand-written training loop) | 2.35 M | 9.2 MB | 320 px | Non-YOLO architecture test |
+| **YOLO11s** | YOLO11n scaled **3.7×** | Ultralytics | 9.43 M | 18.3 MB | 640 px | Capacity test |
+
+Three models sit within 12% of each other in size, so differences between them are *architecture*. YOLO11s changes exactly one variable — capacity — against YOLO11n.
+
+## 4. Training
+
+- **Transfer learning** from COCO-pretrained checkpoints; heads resized to 11 classes (12 incl. background for SSD).
+- **Optimizer** `auto` → AdamW at ≈1e-3. (The commonly copied `AdamW + lr0=0.01` is ~10× too hot and diverges; the SSD loop uses the same 1e-3 policy with cosine schedule + gradient clipping for a fair recipe.)
+- **Budgets:** YOLO26n 100 ep (~96 min) · YOLO11n 59 ep (~40 min) · SSDLite 59 ep (~26 min) · YOLO11s 70 ep, **early-stopped at 64** (peak at 44, patience 20, ~74 min).
+- **Reproducible:** `seed=0`, deterministic — repeated runs produce identical metrics.
+- **Epochs finding:** YOLO26n at 100 epochs peaked *lower* than at 59 (0.2857 @ ep87 vs 0.2898 @ ep41) for 2× the time → the model converges near epoch 40–45; past that, epochs are not the lever.
+- Apple-GPU specifics handled: `PYTORCH_ENABLE_MPS_FALLBACK=1` before importing torch, `amp=False` on MPS, thermal watchdog on epoch times (0 cooldowns triggered in final runs).
+
+## 5. Accuracy (unified evaluation)
+
+All four models re-scored with **one metric** (`torchmetrics` mAP, COCO settings), the **same 143 val images**, every box mapped back to **original-image pixels**, conf floor 0.001 — because Ultralytics' and torchvision's own scorers disagree by a couple of mAP points, enough to flip rankings (and it did: YOLO26n "beat" YOLO11n under its own scorer, and lost under the neutral one).
+
+| Model | mAP@50 | mAP@50-95 | Recall@100 |
+|---|---:|---:|---:|
+| **YOLO11s** | **0.6075** | **0.2975** | 0.4539 |
+| YOLO11n | 0.5858 | 0.2873 | **0.4765** |
+| YOLO26n | 0.5807 | 0.2784 | 0.4557 |
+| SSDLite | 0.4300 | 0.1895 | 0.3314 |
+
+> 🏆 **Best by accuracy: YOLO11s** — highest mAP@50 (0.6075) and mAP@50-95 (0.2975) of all four models.
+> **Best accuracy-per-cost: YOLO11n** — within 0.010 mAP@50-95 of YOLO11s at 1.6× the speed and 3.5× smaller, which is why it is the deployment recommendation in §7.
+
+**Per-class — worn vs missing PPE (mAP@50-95):**
+
+| Class | YOLO11n | YOLO26n | YOLO11s | SSDLite |
+|---|---:|---:|---:|---:|
+| vest | 0.520 | 0.496 | 0.507 | 0.421 |
+| helmet | 0.434 | 0.410 | 0.439 | 0.275 |
+| `no_helmet` | 0.163 | 0.091 | 0.119 | 0.088 |
+| `no_goggle` | 0.045 | 0.060 | 0.052 | 0.028 |
+| `no_boots` | 0.011 | 0.079 | 0.151 | 0.009 |
+
+- **SSDLite's gap is resolution, not just architecture:** on small objects it scores 0.009 vs YOLO11n's 0.108 (12×) — a 320 px input erases distant goggles/gloves.
+- **3.7× capacity did not rescue the rare classes:** YOLO11s vs best-nano deltas are −0.044 / −0.008 / +0.018 / +0.072 — two up, two down, ≈ zero on average (and the one jump rests on 88 training examples).
+
+## 6. Speed (FPS)
+
+Single-image latency, warmed up, device-synchronized — the way frames arrive from a camera. Realtime bar = 30 FPS.
+
+| Model | M2 Pro GPU @ native input | CPU only |
+|---|---:|---:|
+| YOLO26n | **109 FPS** (9.2 ms) | ~19 FPS @640 / ~45 FPS @416 |
+| YOLO11n | 102 FPS | ~19 FPS |
+| YOLO11s | 64 FPS | ~14 FPS |
+| SSDLite | 51 FPS @320 | ~8–16 FPS |
+
+All four clear realtime on GPU; the nanos clear it ~3× over. Live-camera demo runs at the webcam's own 28–30 FPS using threaded capture (serial loop: 22 FPS; threaded: 117 FPS capability — the bottleneck was `cap.read()` at 35 ms, not the model at 6 ms).
+
+## 7. Inference — what this all means
+
+1. **Within the YOLO family at nano scale, generation barely matters** — YOLO26n and YOLO11n are statistically tied (Δ mAP50-95 ≈ 0.009). Input resolution and small-object handling (the SSD result) matter far more than architecture novelty.
+2. **Capacity has hit diminishing returns:** 3.7× parameters bought +0.010 mAP50-95 at 40% less throughput. Accuracy-per-FLOP peaks at nano size for this dataset.
+3. **The ceiling is the data, not the model.** Four models — two frameworks, two detection paradigms, 4× capacity range — fail the same four `missing-PPE` classes in the same order, tracking training frequency. A fifth architecture would be wasted effort.
+4. **Deployment pick: YOLO11n** — within 0.010 mAP50-95 of the best model at 1.6× its speed and 3.5× smaller. (YOLO26n's NMS-free export becomes the argument if frame-time *predictability* across many streams matters most.)
+5. **Honest status:** the system detects *worn* PPE well and *missing* PPE poorly — so this is a demonstration, not yet a deployable safety product. Next steps, by expected payoff: **merge the four `no_*` classes into one `missing_ppe` class** (pools ~1,270 scarce examples, and matches the real business question "is this person compliant"), oversample / loss-weight rare classes, and label more missing-PPE images.
